@@ -30,10 +30,12 @@
                         {% endif %}
                     </td>
                     <td>
-                        <a href="{{ url_for('toggle_user', username=u.username) }}"
-                           class="btn btn-sm {% if u.active %}btn-warning{% else %}btn-success{% endif %}">
-                            {% if u.active %}Desactivar{% else %}Activar{% endif %}
-                        </a>
+                        <form method="POST" action="{{ url_for('toggle_user', username=u.username) }}">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit" class="btn btn-sm {% if u.active %}btn-warning{% else %}btn-success{% endif %}">
+                                {% if u.active %}Desactivar{% else %}Activar{% endif %}
+                            </button>
+                        </form>
                     </td>
                 </tr>
             {% endfor %}
