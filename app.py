@@ -1,7 +1,7 @@
 from flask import Flask, render_template, request, redirect, url_for, session, flash, abort
-import json
 import os
 import secrets
+from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 
@@ -12,15 +12,21 @@ from datetime import datetime
 
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(32))
+
+database_url = os.getenv("DATABASE_URL")
+if not database_url:
+    raise RuntimeError("DATABASE_URL no está configurada.")
+
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url.replace("postgres://", "postgresql://", 1)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
     SESSION_COOKIE_SECURE=os.getenv('SESSION_COOKIE_SECURE', 'false').lower() == 'true'
 )
 
-QUESTIONS_FILE = 'data/questions.json'
-USERS_FILE = 'data/users.json'
-STATS_FILE = 'data/stats.json'
+db = SQLAlchemy(app)
 
 QUESTIONS_PER_PAGE = 3
 
@@ -50,25 +56,135 @@ def validate_csrf_or_abort():
 # ---------------------- UTILIDADES --------------------
 # ======================================================
 
+class User(db.Model):
+    __tablename__ = 'users'
+
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(120), unique=True, nullable=False)
+    email = db.Column(db.String(255), unique=True, nullable=False)
+    password = db.Column(db.String(255), nullable=False)
+    active = db.Column(db.Boolean, default=False, nullable=False)
+    role = db.Column(db.String(50), default='user', nullable=False)
+    progress = db.Column(db.JSON, nullable=False, default=dict)
+    avatar_url = db.Column(db.Text, nullable=True)
+
+    def to_dict(self):
+        return {
+            'username': self.username,
+            'email': self.email,
+            'password': self.password,
+            'active': self.active,
+            'role': self.role,
+            'progress': self.progress or {'completed_questions': [], 'by_category': {}},
+            'avatar_url': self.avatar_url
+        }
+
+
+class Question(db.Model):
+    __tablename__ = 'questions'
+
+    id = db.Column(db.String(64), primary_key=True)
+    category = db.Column(db.String(120), nullable=False)
+    question = db.Column(db.Text, nullable=False)
+    options = db.Column(db.JSON, nullable=False)
+    answer = db.Column(db.Text, nullable=False)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'category': self.category,
+            'question': self.question,
+            'options': self.options or [],
+            'answer': self.answer
+        }
+
+
+class Stat(db.Model):
+    __tablename__ = 'stats'
+
+    question_id = db.Column(db.String(64), primary_key=True)
+    correct = db.Column(db.Integer, nullable=False, default=0)
+    wrong = db.Column(db.Integer, nullable=False, default=0)
+
+
+class Ticket(db.Model):
+    __tablename__ = 'tickets'
+
+    id = db.Column(db.String(64), primary_key=True)
+    email = db.Column(db.String(255), nullable=False)
+    plan = db.Column(db.String(120), nullable=False)
+    amount = db.Column(db.Integer, nullable=False)
+    payment_method = db.Column(db.String(120), nullable=False)
+    status = db.Column(db.String(50), nullable=False)
+    created_at = db.Column(db.String(64), nullable=False)
+    paid_at = db.Column(db.String(64), nullable=True)
+
+    def to_dict(self):
+        payload = {
+            'id': self.id,
+            'email': self.email,
+            'plan': self.plan,
+            'amount': self.amount,
+            'payment_method': self.payment_method,
+            'status': self.status,
+            'created_at': self.created_at,
+        }
+        if self.paid_at:
+            payload['paid_at'] = self.paid_at
+        return payload
+
+
 def load_questions():
-    if not os.path.exists(QUESTIONS_FILE):
-        return []
-    with open(QUESTIONS_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    return [q.to_dict() for q in Question.query.all()]
 
 def save_questions(questions):
-    with open(QUESTIONS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(questions, f, indent=4, ensure_ascii=False)
+    existing = {q.id: q for q in Question.query.all()}
+    incoming_ids = set()
+
+    for data in questions:
+        qid = data['id']
+        incoming_ids.add(qid)
+        q = existing.get(qid)
+        if not q:
+            q = Question(id=qid)
+            db.session.add(q)
+        q.category = data.get('category', '')
+        q.question = data.get('question', '')
+        q.options = data.get('options', [])
+        q.answer = data.get('answer', '')
+
+    for qid, q in existing.items():
+        if qid not in incoming_ids:
+            db.session.delete(q)
+
+    db.session.commit()
 
 def load_users():
-    if not os.path.exists(USERS_FILE):
-        return []
-    with open(USERS_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    return [u.to_dict() for u in User.query.all()]
 
 def save_users(users):
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(users, f, indent=4, ensure_ascii=False)
+    existing = {u.username: u for u in User.query.all()}
+    incoming = set()
+
+    for data in users:
+        username = data['username']
+        incoming.add(username)
+        user = existing.get(username)
+        if not user:
+            user = User(username=username)
+            db.session.add(user)
+        user.email = data.get('email', '')
+        user.password = data.get('password', '')
+        user.active = bool(data.get('active', False))
+        user.role = data.get('role', 'user')
+        user.progress = data.get('progress', {'completed_questions': [], 'by_category': {}})
+        user.avatar_url = data.get('avatar_url')
+
+    for username, user in existing.items():
+        if username not in incoming:
+            db.session.delete(user)
+
+    db.session.commit()
 
 
 def load_categories():
@@ -80,14 +196,32 @@ def load_categories():
 # ======================================================
 
 def load_stats():
-    if not os.path.exists(STATS_FILE):
-        return {}
-    with open(STATS_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    stats = {}
+    for row in Stat.query.all():
+        stats[row.question_id] = {
+            'correct': row.correct,
+            'wrong': row.wrong
+        }
+    return stats
 
 def save_stats(stats):
-    with open(STATS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(stats, f, indent=4, ensure_ascii=False)
+    existing = {s.question_id: s for s in Stat.query.all()}
+    incoming = set()
+
+    for question_id, values in stats.items():
+        incoming.add(question_id)
+        row = existing.get(question_id)
+        if not row:
+            row = Stat(question_id=question_id)
+            db.session.add(row)
+        row.correct = int(values.get('correct', 0))
+        row.wrong = int(values.get('wrong', 0))
+
+    for question_id, row in existing.items():
+        if question_id not in incoming:
+            db.session.delete(row)
+
+    db.session.commit()
 
 def register_answer(question_id, is_correct):
     stats = load_stats()
@@ -152,9 +286,14 @@ def calculate_progress_data(user, category=None):
 # ======================================================
 
 @app.route('/')
+def index():
+    return redirect(url_for('landing'))
+
+
+@app.route('/home')
 def home():
     if 'username' not in session:
-        return render_template('home.html')
+        return redirect(url_for('landing'))
 
     users = load_users()
     user = next(u for u in users if u['username'] == session['username'])
@@ -279,7 +418,9 @@ def delete_question(question_id):
 # ======================================================
 
 from werkzeug.utils import secure_filename
-import pandas as pd
+import csv
+from io import StringIO, BytesIO
+from openpyxl import load_workbook
 
 @app.route('/import_questions', methods=['POST'])
 def import_questions():
@@ -296,11 +437,26 @@ def import_questions():
     # Determinar tipo
     ext = filename.split(".")[-1].lower()
 
+    required_cols = ["category", "question", "option1", "option2", "option3", "answer"]
+
     try:
+        rows = []
         if ext == "csv":
-            df = pd.read_csv(file)
+            content = file.stream.read().decode('utf-8-sig')
+            reader = csv.DictReader(StringIO(content))
+            for row in reader:
+                rows.append(row)
         elif ext in ["xlsx", "xls"]:
-            df = pd.read_excel(file)
+            data = file.read()
+            wb = load_workbook(filename=BytesIO(data), read_only=True, data_only=True)
+            ws = wb.active
+            headers = [str(c).strip() if c is not None else '' for c in next(ws.iter_rows(min_row=1, max_row=1, values_only=True))]
+            for vals in ws.iter_rows(min_row=2, values_only=True):
+                row = {
+                    headers[i]: ('' if vals[i] is None else str(vals[i]))
+                    for i in range(min(len(headers), len(vals)))
+                }
+                rows.append(row)
         else:
             flash('❌ Tipo de archivo no soportado (usa CSV o Excel).', 'danger')
             return redirect(url_for('dashboard'))
@@ -308,9 +464,12 @@ def import_questions():
         flash(f'❌ Error al leer archivo: {e}', 'danger')
         return redirect(url_for('dashboard'))
 
-    required_cols = ["category", "question", "option1", "option2", "option3", "answer"]
+    if not rows:
+        flash('❌ El archivo está vacío o no tiene filas válidas.', 'danger')
+        return redirect(url_for('dashboard'))
+
     for col in required_cols:
-        if col not in df.columns:
+        if col not in rows[0].keys():
             flash(f'❌ Falta columna obligatoria: {col}', 'danger')
             return redirect(url_for('dashboard'))
 
@@ -321,18 +480,20 @@ def import_questions():
 
     new_questions = []
 
-    for _, row in df.iterrows():
+    for row in rows:
         new_q = {
             "id": os.urandom(4).hex(),
-            "category": str(row["category"]).strip(),
-            "question": str(row["question"]).strip(),
+            "category": str(row.get("category", "")).strip(),
+            "question": str(row.get("question", "")).strip(),
             "options": [
-                str(row["option1"]).strip(),
-                str(row["option2"]).strip(),
-                str(row["option3"]).strip(),
+                str(row.get("option1", "")).strip(),
+                str(row.get("option2", "")).strip(),
+                str(row.get("option3", "")).strip(),
             ],
-            "answer": str(row["answer"]).strip()
+            "answer": str(row.get("answer", "")).strip()
         }
+        if not all([new_q["category"], new_q["question"], new_q["answer"]]):
+            continue
         new_questions.append(new_q)
 
         # Registrar categoría si es nueva
@@ -623,26 +784,40 @@ def landing():
 # ------------------ TICKETS DE COMPRA ----------------
 # ======================================================
 
-TICKETS_FILE = 'data/tickets.json'
-
 
 def load_tickets():
-    if not os.path.exists(TICKETS_FILE):
-        return []
-    with open(TICKETS_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    return [t.to_dict() for t in Ticket.query.all()]
 
 
 def save_tickets(tickets):
-    with open(TICKETS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(tickets, f, indent=4, ensure_ascii=False)
+    existing = {t.id: t for t in Ticket.query.all()}
+    incoming = set()
+
+    for data in tickets:
+        ticket_id = data['id']
+        incoming.add(ticket_id)
+        ticket = existing.get(ticket_id)
+        if not ticket:
+            ticket = Ticket(id=ticket_id)
+            db.session.add(ticket)
+        ticket.email = data.get('email', '').lower()
+        ticket.plan = data.get('plan', 'pro')
+        ticket.amount = int(data.get('amount', 0))
+        ticket.payment_method = data.get('payment_method', 'manual')
+        ticket.status = data.get('status', 'pending')
+        ticket.created_at = data.get('created_at', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        ticket.paid_at = data.get('paid_at')
+
+    for ticket_id, ticket in existing.items():
+        if ticket_id not in incoming:
+            db.session.delete(ticket)
+
+    db.session.commit()
 
 
 # ======================================================
 # CREAR TICKET (MANUAL) → REDIRIGE A POST-PAGO
 # ======================================================
-
-from datetime import datetime
 
 
 @app.route('/create_ticket', methods=['POST'])
@@ -724,6 +899,10 @@ def admin_mark_paid(ticket_id):
     save_users(users)
 
     return redirect(url_for("admin_payments"))
+
+with app.app_context():
+    db.create_all()
+
 
 # ======================================================
 # ---------------------- EJECUCIÓN ----------------------
