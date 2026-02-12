@@ -59,10 +59,12 @@
 
                         <td>
                             {% if t.status != "paid" %}
-                                <a href="{{ url_for('admin_mark_paid', ticket_id=t.id) }}"
-                                   class="btn btn-sm btn-success">
-                                    ✔ Marcar como pagado
-                                </a>
+                                <form method="POST" action="{{ url_for('admin_mark_paid', ticket_id=t.id) }}">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <button type="submit" class="btn btn-sm btn-success">
+                                        ✔ Marcar como pagado
+                                    </button>
+                                </form>
                             {% else %}
                                 —
                             {% endif %}

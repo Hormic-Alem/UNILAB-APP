@@ -1,6 +1,7 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask import Flask, render_template, request, redirect, url_for, session, flash, abort
 import json
 import os
+import secrets
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 
@@ -10,13 +11,40 @@ from datetime import datetime
 # ======================================================
 
 app = Flask(__name__)
-app.secret_key = 'tu_clave_secreta_aqui'
+app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(32))
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=os.getenv('SESSION_COOKIE_SECURE', 'false').lower() == 'true'
+)
 
 QUESTIONS_FILE = 'data/questions.json'
 USERS_FILE = 'data/users.json'
 STATS_FILE = 'data/stats.json'
 
 QUESTIONS_PER_PAGE = 3
+
+
+def is_admin_session():
+    return session.get('role') == 'admin'
+
+
+def csrf_token():
+    token = session.get('_csrf_token')
+    if not token:
+        token = secrets.token_hex(16)
+        session['_csrf_token'] = token
+    return token
+
+
+app.jinja_env.globals['csrf_token'] = csrf_token
+
+
+def validate_csrf_or_abort():
+    session_token = session.get('_csrf_token')
+    form_token = request.form.get('csrf_token')
+    if not session_token or not form_token or not secrets.compare_digest(session_token, form_token):
+        abort(400, description='CSRF token inválido.')
 
 # ======================================================
 # ---------------------- UTILIDADES --------------------
@@ -41,6 +69,11 @@ def load_users():
 def save_users(users):
     with open(USERS_FILE, 'w', encoding='utf-8') as f:
         json.dump(users, f, indent=4, ensure_ascii=False)
+
+
+def load_categories():
+    questions = load_questions()
+    return sorted(set(q.get('category', '') for q in questions if q.get('category')))
 
 # ======================================================
 # ---------- ESTADÍSTICAS GLOBALES NUEVAS -------------
@@ -191,7 +224,7 @@ def home():
 
 @app.route('/dashboard')
 def dashboard():
-    if 'username' not in session or session['username'] != 'admin':
+    if 'username' not in session or not is_admin_session():
         return redirect(url_for('login'))
 
     questions = load_questions()
@@ -203,7 +236,7 @@ def dashboard():
 
 @app.route('/add', methods=['GET', 'POST'])
 def add_question():
-    if 'username' not in session or session['username'] != 'admin':
+    if 'username' not in session or not is_admin_session():
         return redirect(url_for('login'))
 
     if request.method == 'POST':
@@ -227,10 +260,12 @@ def add_question():
 
     return render_template('add_question.html')
 
-@app.route('/delete/<question_id>')
+@app.route('/delete/<question_id>', methods=['POST'])
 def delete_question(question_id):
-    if 'username' not in session or session['username'] != 'admin':
+    if 'username' not in session or not is_admin_session():
         return redirect(url_for('login'))
+
+    validate_csrf_or_abort()
 
     questions = load_questions()
     questions = [q for q in questions if q['id'] != question_id]
@@ -248,7 +283,7 @@ import pandas as pd
 
 @app.route('/import_questions', methods=['POST'])
 def import_questions():
-    if 'username' not in session or session['username'] != 'admin':
+    if 'username' not in session or not is_admin_session():
         return redirect(url_for('login'))
 
     file = request.files.get('file')
@@ -346,7 +381,7 @@ def login():
             session['role'] = user.get('role')   # opcional pero útil para admin
 
             # Redirección
-            if user['username'] == 'admin':
+            if user.get('role') == 'admin':
                 return redirect(url_for('dashboard'))
             else:
                 return redirect(url_for('home'))
@@ -512,16 +547,18 @@ def register():
 
 @app.route('/admin_users')
 def admin_users():
-    if 'username' not in session or session['username'] != 'admin':
+    if 'username' not in session or not is_admin_session():
         return redirect(url_for('login'))
 
     users = load_users()
     return render_template('admin_users.html', users=users)
 
-@app.route('/toggle_user/<username>')
+@app.route('/toggle_user/<username>', methods=['POST'])
 def toggle_user(username):
-    if 'username' not in session or session['username'] != 'admin':
+    if 'username' not in session or not is_admin_session():
         return redirect(url_for('login'))
+
+    validate_csrf_or_abort()
 
     users = load_users()
     for user in users:
@@ -567,12 +604,7 @@ def reset_category(category):
 ##############################################
 @app.route("/landing")
 def landing():
-
-    # === Cargar categorías usando la misma función que usa HOME ===
-    try:
-        categories = load_categories()  # esta función ya existe en tu app
-    except:
-        categories = []
+    categories = load_categories()
 
     # En caso extremo, si load_categories falla, ponemos dummy realistas
     if not categories:
@@ -654,12 +686,20 @@ def post_pago():
 
 @app.route("/admin/payments")
 def admin_payments():
+    if 'username' not in session or not is_admin_session():
+        return redirect(url_for('login'))
+
     tickets = load_tickets()
     return render_template("admin_payments.html", tickets=tickets)
 
 
-@app.route("/admin/mark-paid/<ticket_id>")
+@app.route("/admin/mark-paid/<ticket_id>", methods=['POST'])
 def admin_mark_paid(ticket_id):
+    if 'username' not in session or not is_admin_session():
+        return redirect(url_for('login'))
+
+    validate_csrf_or_abort()
+
     tickets = load_tickets()
     users = load_users()
 
@@ -690,4 +730,4 @@ def admin_mark_paid(ticket_id):
 # ======================================================
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=os.getenv('FLASK_DEBUG', 'false').lower() == 'true')
