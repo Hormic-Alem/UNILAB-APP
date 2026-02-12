@@ -152,9 +152,14 @@ def calculate_progress_data(user, category=None):
 # ======================================================
 
 @app.route('/')
+def index():
+    return redirect(url_for('landing'))
+
+
+@app.route('/home')
 def home():
     if 'username' not in session:
-        return render_template('home.html')
+        return redirect(url_for('landing'))
 
     users = load_users()
     user = next(u for u in users if u['username'] == session['username'])
